@@ -1,7 +1,6 @@
 # 🧠 T81Coin: A Symbolic Ternary Cryptocurrency for Recursive Intelligence
 
 **Version**: Draft 0.1  
-**Author**: Michael Kane, Copyleft Systems  
 **Date**: 2025  
 **License**: CC-BY-SA / MIT
 

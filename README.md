@@ -3,7 +3,7 @@
 **Version**: Draft 0.1  
 **Author**: Michael Kane, Copyleft Systems  
 **Date**: 2025  
-**License**: CC-BY-SA / Copyleft
+**License**: CC-BY-SA / MIT
 
 ---
 

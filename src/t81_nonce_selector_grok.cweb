@@ -1,0 +1,188 @@
+@* Upgraded Recursive Ternary Nonce Selector with Entropy Pruning *@
+This program generates ternary sequences (nonces) of trits (-1, 0, +1) up to a configurable maximum depth, pruning paths with low entropy to focus on sequences with high randomness. It integrates a SHA-256 hash function to evaluate nonces, stores valid results, and supports configurable parameters via command-line arguments.
+@c
+
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <openssl/sha.h> // For SHA-256 hashing
+#define DEFAULT_MAX_DEPTH 16
+#define DEFAULT_TARGET_ENTROPY 1.2
+#define DEFAULT_DIFFICULTY 2 // Number of leading zero bytes in hash
+#define MAX_NONCES 1000 // Maximum number of valid nonces to store
+typedef int8_t Trit; // -1, 0, +1
+typedef struct {
+    Trit digits[DEFAULT_MAX_DEPTH];
+    int length;
+} T81Nonce;
+typedef struct {
+    T81Nonce* nonces;
+    int count;
+    int capacity;
+} NonceStore;
+@<Global Variables@>
+@<Entropy Scoring@>
+@<Ternary Utilities@>
+@<Hashing Utilities@>
+@<Nonce Storage@>
+@<Recursive Nonce Selector@>
+@<Command-Line Parsing@>
+int main(int argc, char* argv[]) {
+    int max_depth = DEFAULT_MAX_DEPTH;
+    double target_entropy = DEFAULT_TARGET_ENTROPY;
+    int difficulty = DEFAULT_DIFFICULTY;
+
+@<Parse Command-Line Arguments@>
+
+// Initialize nonce storage
+NonceStore store;
+init_nonce_store(&store, MAX_NONCES);
+
+T81Nonce start = { .length = 0 };
+printf("Starting recursive nonce selection (max_depth=%d, entropy=%.2f, difficulty=%d)...\n",
+       max_depth, target_entropy, difficulty);
+
+recurse_nonce_search(start, 0, max_depth, target_entropy, difficulty, &store);
+
+// Print results
+printf("\nFound %d valid nonces:\n", store.count);
+for (int i = 0; i < store.count; ++i) {
+    printf("Nonce %d: ", i + 1);
+    print_nonce(&store.nonces[i]);
+}
+
+free_nonce_store(&store);
+return 0;
+
+}
+@*1 Global Variables
+@<Global Variables@>=
+static int g_max_depth = DEFAULT_MAX_DEPTH;
+static double g_target_entropy = DEFAULT_TARGET_ENTROPY;
+static int g_difficulty = DEFAULT_DIFFICULTY;
+@*1 Entropy Scoring Functions
+@<Entropy Scoring@>=
+double entropy_score(const T81Nonce* nonce) {
+    if (nonce->length <= 0) return 0.0; // Early return for empty nonce
+    int counts[3] = {0};
+    for (int i = 0; i < nonce->length; ++i) {
+        if (nonce->digits[i] < -1 || nonce->digits[i] > 1) {
+            fprintf(stderr, "Invalid trit value: %d\n", nonce->digits[i]);
+            exit(1);
+        }
+        counts[nonce->digits[i] + 1]++;
+    }
+    double score = 0.0;
+    for (int i = 0; i < 3; ++i) {
+        if (counts[i] > 0) {
+            double p = counts[i] / (double)nonce->length;
+            score -= p * log2(p);
+        }
+    }
+    return score;
+}
+@*1 Ternary Utilities
+@<Ternary Utilities@>=
+void print_nonce(const T81Nonce* nonce) {
+    for (int i = 0; i < nonce->length; ++i) {
+        Trit t = nonce->digits[i];
+        putchar(t == -1 ? '-' : (t == 0 ? '0' : '+'));
+    }
+    putchar('\n');
+}
+@*1 Hashing Utilities
+@<Hashing Utilities@>=
+int check_hash(const T81Nonce* nonce, int difficulty) {
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256((unsigned char*)nonce->digits, nonce->length * sizeof(Trit), hash);
+
+// Check for 'difficulty' leading zero bytes
+for (int i = 0; i < difficulty; ++i) {
+    if (hash[i] != 0) return 0;
+}
+return 1;
+
+}
+@*1 Nonce Storage
+@<Nonce Storage@>=
+void init_nonce_store(NonceStore* store, int capacity) {
+    store->nonces = (T81Nonce*)malloc(capacity * sizeof(T81Nonce));
+    if (!store->nonces) {
+        fprintf(stderr, "Failed to allocate nonce store\n");
+        exit(1);
+    }
+    store->count = 0;
+    store->capacity = capacity;
+}
+void store_nonce(NonceStore* store, const T81Nonce* nonce) {
+    if (store->count >= store->capacity) {
+        fprintf(stderr, "Nonce store capacity exceeded\n");
+        return;
+    }
+    memcpy(&store->nonces[store->count], nonce, sizeof(T81Nonce));
+    store->count++;
+}
+void free_nonce_store(NonceStore* store) {
+    free(store->nonces);
+    store->nonces = NULL;
+    store->count = 0;
+    store->capacity = 0;
+}
+@*1 Recursive Nonce Selector
+@<Recursive Nonce Selector@>=
+void recurse_nonce_search(T81Nonce nonce, int depth, int max_depth, 
+                        double target_entropy, int difficulty, NonceStore* store) {
+    if (depth >= max_depth) return;
+
+// Early entropy check for pruning (after length > 3)
+double score = entropy_score(&nonce);
+if (nonce.length > 3 && score < target_entropy) return;
+
+// Check nonce at any depth if entropy is sufficient
+if (nonce.length >= 1 && score >= target_entropy && check_hash(&nonce, difficulty)) {
+    store_nonce(store, &nonce);
+}
+
+// Try all possible trit values
+for (Trit t = -1; t <= 1; ++t) {
+    nonce.digits[depth] = t;
+    nonce.length = depth + 1;
+    recurse_nonce_search(nonce, depth + 1, max_depth, target_entropy, difficulty, store);
+}
+
+}
+@*1 Command-Line Parsing
+@<Command-Line Parsing@>=
+void parse_args(int argc, char* argv[], int* max_depth, double* target_entropy, int* difficulty) {
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--max-depth") == 0 && i + 1 < argc) {
+            *max_depth = atoi(argv[++i]);
+            if (*max_depth <= 0 || *max_depth > DEFAULT_MAX_DEPTH) {
+                fprintf(stderr, "Invalid max_depth: %d\n", *max_depth);
+                exit(1);
+            }
+        } else if (strcmp(argv[i], "--entropy") == 0 && i + 1 < argc) {
+            *target_entropy = atof(argv[++i]);
+            if (*target_entropy <= 0.0 || *target_entropy > log2(3.0)) {
+                fprintf(stderr, "Invalid entropy: %.2f\n", *target_entropy);
+                exit(1);
+            }
+        } else if (strcmp(argv[i], "--difficulty") == 0 && i + 1 < argc) {
+            *difficulty = atoi(argv[++i]);
+            if (*difficulty < 0 || *difficulty > SHA256_DIGEST_LENGTH) {
+                fprintf(stderr, "Invalid difficulty: %d\n", *difficulty);
+                exit(1);
+            }
+        } else {
+            fprintf(stderr, "Unknown argument: %s\n", argv[i]);
+            exit(1);
+        }
+    }
+}
+@<Parse Command-Line Arguments@>=
+parse_args(argc, argv, &max_depth, &target_entropy, &difficulty);
+g_max_depth = max_depth;
+g_target_entropy = target_entropy;
+g_difficulty = difficulty;

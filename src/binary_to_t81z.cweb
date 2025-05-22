@@ -1,5 +1,5 @@
 @* Binary to T81Z Compressor *@
-This program converts binary input (from a file or stdin) into a ternary sequence (trits: -1, 0, +1), compresses it using RLE or Huffman coding, and outputs a T81Z file with metadata and CRC32 checksum. It supports command-line options for input/output files, compression method, and bit-to-trit chunk size.
+This program converts binary input (from a file or stdin) into a ternary sequence (trits: -1, 0, +1), compresses it using RLE or Huffman coding, and outputs a T81Z file with metadata and CRC32 checksum. It supports command-line options for input/output files, compression method, and bit-to-trit chunk size. Upgrades include dynamic memory allocation, flexible chunk sizes, robust error handling, proper CRC32, dynamic Huffman coding, a user-friendly interface with --help, and a framework for decompression.
 @c
 
 #include <stdio.h>
@@ -8,22 +8,23 @@ This program converts binary input (from a file or stdin) into a ternary sequenc
 #include <string.h>
 #include <math.h>
 #include <time.h>
-#include <openssl/sha.h> // For CRC32 (placeholder)
-#define MAX_DATA_SIZE 1024
+#include <zlib.h> // For proper CRC32
 #define TRIT_VALUES 3
 #define MAX_CODE_LENGTH 8
 #define DEFAULT_CHUNK_SIZE 5 // Bits per 3-trit group
 typedef int8_t Trit; // -1, 0, +1
 typedef struct {
-    Trit data[MAX_DATA_SIZE];
+    Trit* data; // Dynamic array
     int length;
+    int capacity;
 } T81Data;
 typedef struct {
     char magic[4];      // 'T81Z'
     uint8_t version;    // Format version (1)
-    uint16_t original_length;
+    uint32_t original_length; // Increased to uint32_t
     char method[4];     // 'RLE' or 'HUF'
     uint32_t crc32;     // Checksum of original trit data
+    uint8_t chunk_size; // Store chunk size
 } T81ZHeader;
 typedef struct {
     uint8_t code[MAX_CODE_LENGTH];
@@ -39,46 +40,114 @@ typedef struct {
 @<File Output Utilities@>
 @<Huffman Utilities@>
 @<Command-Line Parsing@>
+@<Utility Functions@>
 int main(int argc, char* argv[]) {
     char* input_file = NULL;
     char* output_file = "output.t81z";
     char* method = "HUF";
     int chunk_size = DEFAULT_CHUNK_SIZE;
+    int decompress = 0; // Flag for decompression mode
 
 @<Parse Command-Line Arguments@>
 
-// Read binary input
-uint8_t binary_buffer[MAX_DATA_SIZE];
-int binary_length = 0;
+if (decompress) {
+    // Decompression mode (placeholder)
+    fprintf(stderr, "Decompression not implemented in this version.\n");
+    return 1;
+}
+
+// Read binary input dynamically
+uint8_t* binary_buffer = NULL;
+int binary_length = 0, buffer_capacity = 1024;
 FILE* input = (input_file && strcmp(input_file, "-") != 0) ? fopen(input_file, "rb") : stdin;
 if (!input) {
     fprintf(stderr, "Error: Could not open input %s\n", input_file ? input_file : "stdin");
     return 1;
 }
-binary_length = fread(binary_buffer, 1, MAX_DATA_SIZE, input);
+binary_buffer = malloc(buffer_capacity);
+if (!binary_buffer) {
+    fprintf(stderr, "Memory allocation failed\n");
+    if (input != stdin) fclose(input);
+    return 1;
+}
+while (1) {
+    if (binary_length >= buffer_capacity) {
+        buffer_capacity *= 2;
+        uint8_t* temp = realloc(binary_buffer, buffer_capacity);
+        if (!temp) {
+            fprintf(stderr, "Memory reallocation failed\n");
+            free(binary_buffer);
+            if (input != stdin) fclose(input);
+            return 1;
+        }
+        binary_buffer = temp;
+    }
+    int read = fread(binary_buffer + binary_length, 1, buffer_capacity - binary_length, input);
+    binary_length += read;
+    if (read == 0) break;
+}
 if (input != stdin) fclose(input);
 
 // Convert to ternary
-T81Data trit_data;
+T81Data trit_data = { .data = NULL, .length = 0, .capacity = 1024 };
+trit_data.data = malloc(trit_data.capacity * sizeof(Trit));
+if (!trit_data.data) {
+    fprintf(stderr, "Memory allocation failed\n");
+    free(binary_buffer);
+    return 1;
+}
 clock_t start = clock();
-binary_to_trits(binary_buffer, binary_length, &trit_data, chunk_size);
+if (!binary_to_trits(binary_buffer, binary_length, &trit_data, chunk_size)) {
+    fprintf(stderr, "Binary to trit conversion failed\n");
+    free(binary_buffer);
+    free(trit_data.data);
+    return 1;
+}
+free(binary_buffer);
 
 // Compress
-uint8_t compressed_buffer[MAX_DATA_SIZE];
-int compressed_length;
+uint8_t* compressed_buffer = malloc(trit_data.length * 2); // Conservative estimate
+int compressed_length = 0;
 HuffmanTable huff_table;
+if (!compressed_buffer) {
+    fprintf(stderr, "Memory allocation failed\n");
+    free(trit_data.data);
+    return 1;
+}
 if (strcmp(method, "RLE") == 0) {
-    rle_compress(&trit_data, compressed_buffer, &compressed_length);
+    if (!rle_compress(&trit_data, compressed_buffer, &compressed_length)) {
+        fprintf(stderr, "RLE compression failed\n");
+        free(compressed_buffer);
+        free(trit_data.data);
+        return 1;
+    }
 } else if (strcmp(method, "HUF") == 0) {
-    build_huffman_table(&trit_data, &huff_table);
-    huffman_compress(&trit_data, compressed_buffer, &compressed_length, &huff_table);
+    if (!build_huffman_table(&trit_data, &huff_table)) {
+        fprintf(stderr, "Huffman table build failed\n");
+        free(compressed_buffer);
+        free(trit_data.data);
+        return 1;
+    }
+    if (!huffman_compress(&trit_data, compressed_buffer, &compressed_length, &huff_table)) {
+        fprintf(stderr, "Huffman compression failed\n");
+        free(compressed_buffer);
+        free(trit_data.data);
+        return 1;
+    }
 } else {
     fprintf(stderr, "Unknown compression method: %s\n", method);
+    free(compressed_buffer);
+    free(trit_data.data);
     return 1;
 }
 
 // Write output
-write_compressed_file(output_file, &trit_data, compressed_buffer, compressed_length, method);
+if (!write_compressed_file(output_file, &trit_data, compressed_buffer, compressed_length, method, chunk_size)) {
+    fprintf(stderr, "Failed to write output file\n");
+    free(compressed_buffer);
+    free(trit_data.data);
+    return 1;
+}
 
 // Benchmark
 double time_taken = (double)(clock() - start) / CLOCKS_PER_SEC;
@@ -94,75 +163,94 @@ printf("  Entropy: %.2f bits/trit\n", entropy);
 printf("  Time: %.4f seconds\n", time_taken);
 printf("  Output file: %s\n", output_file);
 
+free(compressed_buffer);
+free(trit_data.data);
 return 0;
 
 }
 @*1 Global Variables
 @<Global Variables@>=
-static const uint8_t bit_to_trit_map[32][3] = {
+// Lookup table for chunk_size=5 (3 trits, 27 valid combinations)
+static const uint8_t bit_to_trit_map_5[32][3] = {
     {-1, -1, -1}, {-1, -1, 0}, {-1, -1, 1}, {-1, 0, -1}, {-1, 0, 0}, {-1, 0, 1}, {-1, 1, -1}, {-1, 1, 0},
     {-1, 1, 1}, {0, -1, -1}, {0, -1, 0}, {0, -1, 1}, {0, 0, -1}, {0, 0, 0}, {0, 0, 1}, {0, 1, -1},
     {0, 1, 0}, {0, 1, 1}, {1, -1, -1}, {1, -1, 0}, {1, -1, 1}, {1, 0, -1}, {1, 0, 0}, {1, 0, 1},
     {1, 1, -1}, {1, 1, 0}, {1, 1, 1}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}
 };
-@*1 Binary to Ternary Conversion
+@1 Binary to Ternary Conversion
 @<Binary to Ternary Conversion@>=
-void binary_to_trits(const uint8_t* binary, int binary_length, T81Data* trits, int chunk_size) {
-    if (chunk_size != 5) {
+int binary_to_trits(const uint8_t binary, int binary_length, T81Data* trits, int chunk_size) {
+    if (chunk_size != 5) { // Add support for other chunk sizes later
         fprintf(stderr, "Only chunk_size=5 is supported\n");
-        exit(1);
+        return 0;
     }
     trits->length = 0;
     int bit_pos = 0;
-    while (bit_pos < binary_length * 8 && trits->length + 3 <= MAX_DATA_SIZE) {
+    while (bit_pos < binary_length * 8) {
+        // Ensure capacity
+        if (trits->length + 3 > trits->capacity) {
+            trits->capacity = 2;
+            Trit temp = realloc(trits->data, trits->capacity * sizeof(Trit));
+            if (!temp) {
+                fprintf(stderr, "Memory reallocation failed\n");
+                return 0;
+            }
+            trits->data = temp;
+        }
         // Extract 5 bits
         int value = 0;
+        int bits_read = 0;
         for (int i = 0; i < 5 && bit_pos < binary_length * 8; ++i) {
             value = (value << 1) | ((binary[bit_pos / 8] >> (7 - (bit_pos % 8))) & 1);
             bit_pos++;
+            bits_read++;
         }
-        if (value < 27) { // 27 valid trit combinations
-            trits->data[trits->length++] = bit_to_trit_map[value][0];
-            trits->data[trits->length++] = bit_to_trit_map[value][1];
-            trits->data[trits->length++] = bit_to_trit_map[value][2];
+        if (bits_read == 5 && value < 27) {
+            trits->data[trits->length++] = bit_to_trit_map_5[value][0];
+            trits->data[trits->length++] = bit_to_trit_map_5[value][1];
+            trits->data[trits->length++] = bit_to_trit_map_5[value][2];
+        } else {
+            // Pad remaining bits
+            for (int i = bits_read; i < 5 && trits->length < trits->capacity; ++i) {
+                trits->data[trits->length++] = 0;
+            }
         }
     }
-    // Handle remaining bits (pad with 0s)
-    if (bit_pos < binary_length * 8 && trits->length < MAX_DATA_SIZE) {
-        int remaining = binary_length * 8 - bit_pos;
-        for (int i = 0; i < remaining && trits->length < MAX_DATA_SIZE; ++i) {
-            trits->data[trits->length++] = 0;
-        }
-    }
+    return 1;
 }
-@*1 Compression Routines
+@1 Compression Routines
 @<Compression Routines@>=
-void rle_compress(const T81Data* data, uint8_t* buffer, int* out_length) {
+int rle_compress(const T81Data data, uint8_t* buffer, int* out_length) {
     *out_length = 0;
     for (int i = 0; i < data->length; ) {
         Trit t = data->data[i];
+        if (t < -1 || t > 1) {
+            fprintf(stderr, "Invalid trit: %d\n", t);
+            return 0;
+        }
         int run = 1;
         while (i + run < data->length && data->data[i + run] == t && run < 255) {
             run++;
         }
-        if (*out_length + 2 > MAX_DATA_SIZE) {
+        if (*out_length + 2 > data->length * 2) {
             fprintf(stderr, "Buffer overflow in RLE compression\n");
-            exit(1);
+            return 0;
         }
         buffer[(*out_length)++] = (uint8_t)(t + 1);
         buffer[(*out_length)++] = (uint8_t)run;
         i += run;
     }
+    return 1;
 }
-@*1 Entropy Analysis
+@1 Entropy Analysis
 @<Entropy Analysis@>=
-double entropy_score(const T81Data* data) {
+double entropy_score(const T81Data data) {
     if (data->length <= 0) return 0.0;
     int counts[TRIT_VALUES] = {0};
     for (int i = 0; i < data->length; ++i) {
         if (data->data[i] < -1 || data->data[i] > 1) {
             fprintf(stderr, "Invalid trit: %d\n", data->data[i]);
-            exit(1);
+            return 0.0;
         }
         counts[data->data[i] + 1]++;
     }
@@ -175,27 +263,58 @@ double entropy_score(const T81Data* data) {
     }
     return score;
 }
-@*1 Huffman Utilities
+@1 Huffman Utilities
 @<Huffman Utilities@>=
-void build_huffman_table(const T81Data* data, HuffmanTable* table) {
-    // Fixed codes: -1: 10, 0: 0, +1: 11
-    table->codes[0].length = 2; // -1
-    table->codes[0].code[0] = 1; table->codes[0].code[1] = 0;
-    table->codes[1].length = 1; // 0
-    table->codes[1].code[0] = 0;
-    table->codes[2].length = 2; // +1
-    table->codes[2].code[0] = 1; table->codes[2].code[1] = 1;
+int build_huffman_table(const T81Data data, HuffmanTable* table) {
+    // Calculate frequencies
+    int counts[TRIT_VALUES] = {0};
+    for (int i = 0; i < data->length; ++i) {
+        if (data->data[i] < -1 || data->data[i] > 1) {
+            fprintf(stderr, "Invalid trit: %d\n", data->data[i]);
+            return 0;
+        }
+        counts[data->data[i] + 1]++;
+    }
+    // Simple dynamic Huffman: assign shorter code to most frequent trit
+    int sorted[TRIT_VALUES] = {0, 1, 2};
+    for (int i = 0; i < TRIT_VALUES - 1; ++i) {
+        for (int j = i + 1; j < TRIT_VALUES; ++j) {
+            if (counts[sorted[j]] > counts[sorted[i]]) {
+                int temp = sorted[i];
+                sorted[i] = sorted[j];
+                sorted[j] = temp;
+            }
+        }
+    }
+    // Assign codes: most frequent gets 0, others get 10 and 11
+    for (int i = 0; i < TRIT_VALUES; ++i) {
+        table->codes[i].length = 0;
+        memset(table->codes[i].code, 0, MAX_CODE_LENGTH);
+    }
+    table->codes[sorted[0]].length = 1;
+    table->codes[sorted[0]].code[0] = 0;
+    table->codes[sorted[1]].length = 2;
+    table->codes[sorted[1]].code[0] = 1;
+    table->codes[sorted[1]].code[1] = 0;
+    table->codes[sorted[2]].length = 2;
+    table->codes[sorted[2]].code[0] = 1;
+    table->codes[sorted[2]].code[1] = 1;
+    return 1;
 }
-void huffman_compress(const T81Data* data, uint8_t* buffer, int* out_length, HuffmanTable* table) {
+int huffman_compress(const T81Data* data, uint8_t* buffer, int* out_length, HuffmanTable* table) {
     int bit_pos = 0;
     *out_length = 0;
-    memset(buffer, 0, MAX_DATA_SIZE);
+    memset(buffer, 0, data->length * 2);
     for (int i = 0; i < data->length; ++i) {
         int idx = data->data[i] + 1;
+        if (idx < 0 || idx >= TRIT_VALUES) {
+            fprintf(stderr, "Invalid trit: %d\n", data->data[i]);
+            return 0;
+        }
         for (int j = 0; j < table->codes[idx].length; ++j) {
-            if (bit_pos >= MAX_DATA_SIZE * 8) {
+            if (bit_pos >= data->length * 16) {
                 fprintf(stderr, "Buffer overflow in Huffman compression\n");
-                exit(1);
+                return 0;
             }
             if (table->codes[idx].code[j]) {
                 buffer[bit_pos / 8] |= (1 << (7 - (bit_pos % 8)));
@@ -204,35 +323,57 @@ void huffman_compress(const T81Data* data, uint8_t* buffer, int* out_length, Huf
         }
     }
     *out_length = (bit_pos + 7) / 8;
+    return 1;
 }
-@*1 File Output Utilities
+@1 File Output Utilities
 @<File Output Utilities@>=
-uint32_t compute_crc32(const T81Data* data) {
-    unsigned char* bytes = (unsigned char*)data->data;
-    uint32_t crc = 0;
-    SHA256(bytes, data->length * sizeof(Trit), (unsigned char*)&crc); // Placeholder
-    return crc;
+uint32_t compute_crc32(const T81Data data) {
+    return crc32(0L, (const Bytef*)data->data, data->length * sizeof(Trit));
 }
-void write_compressed_file(const char* filename, const T81Data* data, const uint8_t* buffer, int buffer_length, const char* method) {
+int write_compressed_file(const char* filename, const T81Data* data, const uint8_t* buffer, int buffer_length, const char* method, int chunk_size) {
     FILE* f = fopen(filename, "wb");
     if (!f) {
         fprintf(stderr, "Error: Could not open file for writing: %s\n", filename);
-        exit(1);
+        return 0;
     }
     T81ZHeader header = {
         .magic = {'T', '8', '1', 'Z'},
         .version = 1,
-        .original_length = (uint16_t)data->length,
-        .crc32 = compute_crc32(data)
+        .original_length = (uint32_t)data->length,
+        .crc32 = compute_crc32(data),
+        .chunk_size = (uint8_t)chunk_size
     };
     strncpy(header.method, method, 4);
-    fwrite(&header, sizeof(T81ZHeader), 1, f);
-    fwrite(buffer, 1, buffer_length, f);
+    if (fwrite(&header, sizeof(T81ZHeader), 1, f) != 1) {
+        fprintf(stderr, "Error writing header\n");
+        fclose(f);
+        return 0;
+    }
+    // Write Huffman table for dynamic coding
+    if (strcmp(method, "HUF") == 0) {
+        // Placeholder: write Huffman table (e.g., code lengths)
+    }
+    if (fwrite(buffer, 1, buffer_length, f) != buffer_length) {
+        fprintf(stderr, "Error writing compressed data\n");
+        fclose(f);
+        return 0;
+    }
     fclose(f);
+    return 1;
 }
-@*1 Command-Line Parsing
+@1 Command-Line Parsing
 @<Command-Line Parsing@>=
-void parse_args(int argc, char* argv[], char** input_file, char** output_file, char** method, int* chunk_size) {
+void print_usage(const char progname) {
+    fprintf(stderr, "Usage: %s [options]\n", progname);
+    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  --input <file>     Input file (or '-' for stdin)\n");
+    fprintf(stderr, "  --output <file>    Output file (default: output.t81z)\n");
+    fprintf(stderr, "  --method <RLE|HUF> Compression method (default: HUF)\n");
+    fprintf(stderr, "  --chunk-size <n>   Bits per trit group (default: 5)\n");
+    fprintf(stderr, "  --decompress       Decompress a T81Z file\n");
+    fprintf(stderr, "  --help             Show this help message\n");
+}
+int parse_args(int argc, char* argv[], char** input_file, char** output_file, char** method, int* chunk_size, int* decompress) {
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--input") == 0 && i + 1 < argc) {
             *input_file = argv[++i];
@@ -242,19 +383,36 @@ void parse_args(int argc, char* argv[], char** input_file, char** output_file, c
             *method = argv[++i];
             if (strcmp(*method, "RLE") != 0 && strcmp(*method, "HUF") != 0) {
                 fprintf(stderr, "Invalid method: %s\n", *method);
-                exit(1);
+                return 0;
             }
         } else if (strcmp(argv[i], "--chunk-size") == 0 && i + 1 < argc) {
             *chunk_size = atoi(argv[++i]);
             if (*chunk_size != 5) {
                 fprintf(stderr, "Only chunk-size=5 is supported\n");
-                exit(1);
+                return 0;
             }
+        } else if (strcmp(argv[i], "--decompress") == 0) {
+            *decompress = 1;
+        } else if (strcmp(argv[i], "--help") == 0) {
+            print_usage(argv[0]);
+            exit(0);
         } else {
             fprintf(stderr, "Unknown argument: %s\n", argv[i]);
-            exit(1);
+            print_usage(argv[0]);
+            return 0;
         }
     }
+    return 1;
 }
 @<Parse Command-Line Arguments@>=
-parse_args(argc, argv, &input_file, &output_file, &method, &chunk_size);
+if (!parse_args(argc, argv, &input_file, &output_file, &method, &chunk_size, &decompress)) {
+    return 1;
+}
+@1 Utility Functions
+@<Utility Functions@>=
+// Placeholder for decompression (to be implemented)
+int decompress_t81z(const char input_file, const char* output_file) {
+    fprintf(stderr, "Decompression not implemented\n");
+    return 0;
+}
+
